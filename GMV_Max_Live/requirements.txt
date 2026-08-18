@@ -1,0 +1,12 @@
+pandas
+pandas-gbq
+gspread
+google-cloud-bigquery
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+oauth2client
+pyarrow
+numpy
+minio 
+python-dotenv
