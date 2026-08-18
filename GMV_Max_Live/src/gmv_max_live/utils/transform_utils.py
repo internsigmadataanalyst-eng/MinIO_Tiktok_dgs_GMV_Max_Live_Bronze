@@ -37,6 +37,28 @@ _NUMERIC_FORBIDDEN = re.compile(r"[^0-9.,Rp\s#-]")
 # 'IDR') is not, while '######' / '-' are treated as censored data, not errors.
 _PERCENT_FORBIDDEN = re.compile(r"[^0-9.,%\s#-]")
 
+# Scientific-notation numbers (e.g. '1,00E+06' = 1.000.000) are legitimately
+# produced by Google Sheets when a cell's number format is scientific. Expand
+# them back to plain numbers before any validation/cleaning step so 'E'/'+'
+# are not mistaken for shifted/corrupted content and values are not mangled.
+_SCIENTIFIC_RE = re.compile(r"^([+-]?)(\d+)[.,](\d+)E([+-]?\d+)$", re.IGNORECASE)
+
+
+def _expand_scientific_str(s: str) -> str:
+    m = _SCIENTIFIC_RE.fullmatch(s.strip())
+    if not m:
+        return s
+    sign, int_part, frac, exp = m.groups()
+    try:
+        value = float(f"{int_part}.{frac}E{exp}")
+    except ValueError:
+        return s
+    if sign == "-":
+        value = -value
+    if value.is_integer():
+        return str(int(value))
+    return ("%.12f" % value).rstrip("0").rstrip(".")
+
 def to_snake_case(column_name: str) -> str:
     return (
         column_name.lower()
@@ -54,7 +76,7 @@ def to_snake_case(column_name: str) -> str:
 def _coerce_numeric_series(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     """Cleans a raw string series into numerics using the exact same steps as
     clean_numeric_columns. Returns (numeric_values, cleaned_string_series)."""
-    s = series.astype(str).str.strip()
+    s = series.astype(str).str.strip().map(_expand_scientific_str)
     s = s.replace("-", np.nan)
     s = s.str.replace(r"[^\d,\.]", "", regex=True)
     s = s.str.replace(".", "", regex=False)
@@ -70,7 +92,7 @@ def clean_numeric_columns(df: pd.DataFrame, cols, fillna_value=0) -> pd.DataFram
             print(f"Kolom '{col}' tidak ditemukan di DataFrame. Lewati Nggih.")
             continue
 
-        df[col] = df[col].astype(str)
+        df[col] = df[col].astype(str).map(_expand_scientific_str)
         df[col] = df[col].replace("-", np.nan)
         df[col] = df[col].str.replace(r"[^\d,\.]", "", regex=True)
         df[col] = df[col].str.replace(".", "", regex=False)
@@ -144,7 +166,7 @@ def detect_numeric_corruption(
         if col not in df.columns:
             continue
 
-        raw = df[col].astype(str).str.strip()
+        raw = df[col].astype(str).str.strip().map(_expand_scientific_str)
         values, _ = _coerce_numeric_series(raw)
 
         is_not_empty = _is_non_empty(raw)
