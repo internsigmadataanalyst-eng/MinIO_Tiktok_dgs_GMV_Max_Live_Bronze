@@ -150,22 +150,55 @@ def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, t
     print(f"[MINIO] Quarantine bad rows to: {file_path}")
 
 
-def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH):
+def _confirmed_recovered_keys(df_valid: pd.DataFrame, candidates: list) -> set:
+    """Which candidate keys (sheet_name, creds, error_date) are PROVEN recovered.
+
+    A key is only confirmed when the same number of valid rows now exist as the
+    manifest's n_rows for that key. Absence from df_error alone is NOT proof of
+    recovery (an error can change signature, e.g. numeric -> date), so unconfirmed
+    keys are kept open instead of being falsely marked fixed.
+    """
+    if df_valid is None or df_valid.empty or not candidates:
+        return set()
+
+    key_series = (
+        df_valid["sheet_name"].astype(str)
+        + "|" + df_valid["creds"].astype(str)
+        + "|" + pd.to_datetime(df_valid["Tanggal"]).dt.date.astype(str)
+    )
+    counts = key_series.value_counts()
+
+    confirmed = set()
+    for rec in candidates:
+        key = f'{rec["sheet_name"]}|{rec["creds"]}|{rec["error_date"]}'
+        n_expected = int(rec.get("n_rows") or 0)
+        if n_expected > 0 and counts.get(key, 0) == n_expected:
+            confirmed.add((str(rec["sheet_name"]), str(rec["creds"]), str(rec["error_date"])))
+    return confirmed
+
+
+def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH, df_valid: pd.DataFrame = None):
     """Syncs the error manifest at error_list_watermark/error_manifest.json.
 
     Runs EVERY run (even with empty df_error):
       1. Reads current open entries.
       2. Builds current-run entries from df_error grouped by
          (sheet_name, creds, error_date) — the same grain as the watermark.
-      3. Resolves: open entries whose key is no longer detected this run are
-         removed from the manifest and written as fix records to
-         fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
+      3. Resolves only entries whose key is no longer detected this run AND is
+         PROVEN recovered (matching rows exist in df_valid with count == n_rows).
+         Confirmed entries are removed from the manifest and written as fix
+         records to fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
       4. Refreshes open entries still detected this run with the latest
          n_rows / affected_columns / path, and appends new open entries not
          already present.
       5. Writes the manifest back only if something changed (avoids creating
          an empty file when there is nothing to do).
+
+    Returns the list of confirmed resolved entries (sheet_name, creds, error_date)
+    so callers can re-load the recovered rows via PATH A (bypassing the watermark).
     """
+    if df_valid is None:
+        df_valid = df_error.iloc[0:0]
     from src.gmv_max_live.utils.transform_utils import parse_mixed_dates
 
     now = datetime.now().isoformat()
@@ -215,14 +248,31 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
 
     current_keys = {(e["sheet_name"], e["creds"], e["error_date"]) for e in current_entries}
 
+    # Only resolve keys that are PROVEN recovered (same count of valid rows as the
+    # manifest n_rows). Absence from df_error is not proof: an error can change
+    # signature (e.g. numeric -> date) and would otherwise be falsely marked fixed,
+    # destroying the recovery hook for a later real fix.
+    confirmed = _confirmed_recovered_keys(df_valid, [
+        {
+            "sheet_name": str(rec.get("sheet_name")),
+            "creds": str(rec.get("creds")),
+            "error_date": str(rec.get("error_date")),
+            "n_rows": rec.get("n_rows"),
+        }
+        for rec in open_records
+        if (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date"))) not in current_keys
+    ])
+
     resolved = []
     refreshed = {}
     for rec in open_records:
         key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
         if key in current_keys:
             refreshed[key] = rec
-        else:
+        elif key in confirmed:
             resolved.append(rec)
+        else:
+            refreshed[key] = rec  # unconfirmed -> keep open
 
     # Fresh current-run entries always win: refresh n_rows / affected_columns /
     # reported_at / path for keys that already exist, append brand-new keys.
@@ -237,7 +287,7 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
     old_payload = json.dumps({"errors": open_records}, ensure_ascii=False, sort_keys=True)
     changed = bool(resolved) or new_payload != old_payload
     if not changed and not manifest_existed:
-        return
+        return []
 
     if resolved:
         fix_folder = f"{FIX_MANIFEST_PREFIX}/date={today_key}/"
@@ -272,6 +322,7 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
     )
     if current_entries:
         print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
+    return resolved
 
 
 def filter_by_sheet_watermark(df: pd.DataFrame, sheet_col: str, date_col: str, watermarks: dict) -> tuple[pd.DataFrame, dict]:

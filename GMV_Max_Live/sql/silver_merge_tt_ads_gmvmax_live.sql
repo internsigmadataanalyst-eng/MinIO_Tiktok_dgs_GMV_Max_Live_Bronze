@@ -1,4 +1,4 @@
-MERGE INTO database-sigma.SILVER_DB.silver_tt_ads_gmvmax_live T
+MERGE INTO database-sigma.Testing.silver_tt_ads_gmvmax_live T
 USING (
 
   WITH latest_raw AS (
@@ -12,10 +12,10 @@ USING (
             UPPER(TRIM(b.id_campaign)),
             UPPER(TRIM(COALESCE(b.nama_live,''))),
             DATE(b.tanggal),
-            COALESCE(b.waktu_peluncuran, TIMESTAMP '1900-01-01 00:00:00')
+            COALESCE(b.waktu_peluncuran, DATETIME '1900-01-01 00:00:00')
           ORDER BY b.snapshot_ts DESC, b.run_id DESC
         ) rn
-      FROM database-sigma.BRONZE_DB.bronze_maxl b
+      FROM database-sigma.Testing.bronze_maxl b
     )
     WHERE rn = 1
   ),
@@ -125,8 +125,8 @@ ON  T.tanggal = S.tanggal
 AND T.toko = S.toko
 AND T.id_campaign = S.id_campaign
 AND COALESCE(T.nama_live,'') = COALESCE(S.nama_live,'')
-AND COALESCE(T.waktu_peluncuran, TIMESTAMP '1900-01-01 00:00:00')
-  = COALESCE(S.waktu_peluncuran, TIMESTAMP '1900-01-01 00:00:00')
+AND COALESCE(T.waktu_peluncuran, DATETIME '1900-01-01 00:00:00')
+  = COALESCE(S.waktu_peluncuran, DATETIME '1900-01-01 00:00:00')
 
 WHEN MATCHED AND T.row_hash_clean != S.row_hash_clean THEN
   UPDATE SET
