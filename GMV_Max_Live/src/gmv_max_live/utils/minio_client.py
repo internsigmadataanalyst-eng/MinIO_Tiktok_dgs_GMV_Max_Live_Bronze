@@ -25,19 +25,15 @@ def get_minio_client() -> tuple[Minio, str]:
     return client, minio_bucket
 
 
-def get_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, sheet_registry: dict | None = None) -> tuple[dict, list]:
+def get_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str) -> tuple[dict, list]:
     """Fetches the per-sheet watermark table from MinIO.
 
-    Args:
-        sheet_registry: {sheet_name: creds} mapping used ONLY to translate the
-            OLD watermark format ({sheet_name,...}) into creds-keyed rows.
+    Assumes the watermark file holds the per-sheet table format
+    ({"sheets": [...]}).
 
     Returns:
         watermark_map: {creds: last_processed_date}
-        records: raw rows as read (old or new shape) — migration happens at write time.
-
-    Assumes the watermark file holds ONLY the per-sheet table format
-    ({"sheets": [...]}); a file with any other shape raises KeyError.
+        records: raw rows as read.
     """
     try:
         minio_client.stat_object(bucket, watermark_path)
@@ -53,60 +49,39 @@ def get_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, 
 
     records = data["sheets"]
 
-    # === FAILSAFE START: old-format read compatibility (sheet_name-keyed) ===
-    # Old format rows: {"sheet_name", "last_processed_date", "updated_at"}.
-    # New format rows: {"creds", "sheet_name", "last_processed_date", "updated_at"}.
-    # A row without "creds" is translated via sheet_registry (sheet_name -> creds).
-    # If translation fails, fall back to sheet_name so the sheet gets a FULL LOAD
-    # (never silently drops data). REMOVE this block after the next successful run.
-    name_to_creds = sheet_registry or {}
     watermark_map = {}
     for rec in records:
-        creds = rec.get("creds")
-        if not creds:
-            creds = name_to_creds.get(str(rec["sheet_name"])) or str(rec["sheet_name"])
-        creds = str(creds)
+        creds = str(rec["creds"])
         date_val = str(rec["last_processed_date"]).strip()[:10]
-        # Beberapa sheet_name bisa berbagi creds (contoh: riwa & riwa_ajwa).
-        # Selalu pakai MAX agar tidak ada data lama yang diproses ulang.
         watermark_map[creds] = max(watermark_map.get(creds, ""), date_val)
-    # === FAILSAFE END ===
 
     print(f"[MINIO] Watermark found for {len(records)} sheet(s).")
     return watermark_map, records
 
 
-def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, prev_records: list, sheet_max_dates: dict, sheet_registry: dict | None = None):
-    """Persists the per-sheet watermark table to MinIO in the NEW format.
+def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, prev_records: list, sheet_max_dates: dict):
+    """Persists the per-sheet watermark table to MinIO.
 
     Only sheets in sheet_max_dates get a new last_processed_date and updated_at.
     Sheets already up-to-date keep their previous values; new sheets are appended.
     """
     now = datetime.now().isoformat()
-    name_to_creds = sheet_registry or {}
-    creds_to_name = {creds: name for name, creds in name_to_creds.items()}
 
-    # === FAILSAFE START: migrate OLD-format prev_records to NEW format ===
-    # Old rows keyed by "sheet_name" are rewritten as {"creds", "sheet_name", ...}
-    # so the file is saved in the NEW format from this run onward.
-    # REMOVE this block (and sheet_registry param) after the next successful run.
     by_creds = {}
     for rec in prev_records:
-        creds = rec.get("creds") or name_to_creds.get(str(rec["sheet_name"])) or str(rec["sheet_name"])
-        sheet_name = creds_to_name.get(creds) or rec.get("sheet_name") or creds
-        by_creds[str(creds)] = {
-            "creds": str(creds),
-            "sheet_name": sheet_name,
+        creds = str(rec.get("creds") or rec.get("sheet_name") or "")
+        by_creds[creds] = {
+            "creds": creds,
+            "sheet_name": rec.get("sheet_name") or creds,
             "last_processed_date": rec["last_processed_date"],
             "updated_at": rec.get("updated_at", ""),
         }
-    # === FAILSAFE END ===
 
     for creds, max_date in sheet_max_dates.items():
         prev_sheet_name = by_creds.get(creds, {}).get("sheet_name")
         by_creds[creds] = {
             "creds": creds,
-            "sheet_name": creds_to_name.get(creds) or prev_sheet_name or creds,
+            "sheet_name": prev_sheet_name or creds,
             "last_processed_date": max_date,
             "updated_at": now,
         }
@@ -127,6 +102,80 @@ def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: st
 ERROR_MANIFEST_PATH = "error_list_watermark/error_manifest.json"
 FIX_MANIFEST_PREFIX = "fix_error_list_watermark"
 QUARANTINE_PREFIX = "quarantine"
+
+
+def _error_date_series(df: pd.DataFrame) -> pd.Series:
+    """Parses the Tanggal column into ISO date strings for error grouping.
+
+    Unparseable dates become the literal 'INVALID_DATE' so they still form a
+    stable group key. Shared by filter_already_quarantined (the dedupe gate)
+    and sync_error_manifest so both use EXACTLY the same matching grain.
+    """
+    from src.gmv_max_live.utils.transform_utils import parse_mixed_dates
+
+    if "Tanggal" in df.columns:
+        parsed = parse_mixed_dates(df["Tanggal"], return_date=False)
+        error_date = parsed.dt.date.astype(str)
+        return error_date.where(parsed.notna(), "INVALID_DATE")
+    return pd.Series("INVALID_DATE", index=df.index)
+
+
+def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.DataFrame, manifest_path: str = ERROR_MANIFEST_PATH) -> pd.DataFrame:
+    """Dedupe gate BEFORE writing quarantine: drops already-quarantined bad rows.
+
+    Compares df_error against the manifest state of the LAST run. A group
+    (sheet_name, creds, error_date) is skipped ONLY when an open manifest entry
+    exists with the same key AND the same n_rows. New tanggal, new sheet, or a
+    changed row count pass through in full and get re-quarantined.
+
+    MUST be called BEFORE sync_error_manifest: that function writes this run's
+    groups into the manifest, so calling it after would make every group look
+    like a duplicate and nothing would ever be quarantined.
+    """
+    if df_error is None or df_error.empty:
+        return df_error
+
+    try:
+        minio_client.stat_object(bucket, manifest_path)
+        response = minio_client.get_object(bucket, manifest_path)
+        data = json.loads(response.read().decode("utf-8"))
+        response.close()
+        response.release_conn()
+        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
+    except S3Error as e:
+        if e.code in ["NoSuchKey", "AccessDenied"]:
+            return df_error
+        raise e
+
+    known = {}
+    for rec in open_records:
+        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
+        try:
+            known[key] = int(rec.get("n_rows") or 0)
+        except (TypeError, ValueError):
+            known[key] = 0
+
+    df = df_error.copy()
+    df["_error_date"] = _error_date_series(df)
+    sn_col = "sheet_name" if "sheet_name" in df.columns else "creds"
+    cr_col = "creds" if "creds" in df.columns else sn_col
+
+    keep = pd.Series(True, index=df.index)
+    n_skip_groups = 0
+    for (sheet_name, creds, error_date), idx in df.groupby([sn_col, cr_col, "_error_date"]).groups.items():
+        key = (str(sheet_name), str(creds), str(error_date))
+        n_rows = len(idx)
+        if known.get(key) == n_rows:
+            keep.loc[idx] = False
+            n_skip_groups += 1
+
+    filtered = df.loc[keep].drop(columns=["_error_date"])
+    skipped = len(df) - int(keep.sum())
+    print(
+        f"[QUARANTINE GATE] {int(keep.sum())} new row(s) -> quarantine | "
+        f"skipped {skipped} duplicate row(s) in {n_skip_groups} group(s)"
+    )
+    return filtered
 
 
 def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, today_key: str, run_key: str):
