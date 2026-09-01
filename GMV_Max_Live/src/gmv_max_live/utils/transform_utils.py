@@ -224,6 +224,7 @@ def validate_and_normalize_raw(
     - Detects mixed/corrupted cells in numeric columns (main filter) and, when
       given, in percentage/rate columns (percent_cols).
     - Parses mixed dates; rows with NaT are captured as date-error rows.
+    - Blank `Toko` rows are quarantined (toko_blank) — watermark grain is (creds,sheet_name,toko).
     - Splits into (df_valid, df_error, report). df_error keeps the ORIGINAL raw
       values plus an error_reason column; df_valid is cleaned for downstream.
     """
@@ -240,7 +241,16 @@ def validate_and_normalize_raw(
     df_clean[date_col] = parsed
     date_error = parsed.isna()
 
-    error_mask = (corruption["affected_mask"] | date_error) & ~blank_mask
+    # Blank toko detection — verbatim, no normalization; blank = "", "-", "nan", "none", "nat"
+    toko_col = "Toko" if "Toko" in df.columns else ("toko" if "toko" in df.columns else None)
+    if toko_col is not None:
+        raw_toko = df[toko_col].astype(str).str.strip()
+        toko_blank = raw_toko.str.lower().isin(["", "-", "nan", "none", "nat"])
+        toko_blank = toko_blank | df[toko_col].isna()
+    else:
+        toko_blank = pd.Series(False, index=df.index)
+
+    error_mask = (corruption["affected_mask"] | date_error | toko_blank) & ~blank_mask
 
     df_error = df[error_mask].copy()
     reasons = []
@@ -250,6 +260,8 @@ def validate_and_normalize_raw(
             reason_parts.append("numeric_mixed")
         if date_error.loc[idx]:
             reason_parts.append("date_unparsable")
+        if toko_blank.loc[idx]:
+            reason_parts.append("toko_blank")
         reasons.append("|".join(reason_parts))
     df_error["error_reason"] = reasons
 
@@ -264,6 +276,7 @@ def validate_and_normalize_raw(
         "n_bad_rows": int(error_mask.sum()),
         "n_date_errors": int(date_error.sum()),
         "n_blank_rows": int(blank_mask.sum()),
+        "n_toko_blank": int(toko_blank.sum()),
     }
 
     return df_valid, df_error, report
