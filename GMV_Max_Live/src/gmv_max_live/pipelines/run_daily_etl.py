@@ -117,7 +117,6 @@ def _finish(
     show_watermark(watermark_records)
     print(note)
     subject, body_html = build_pipeline_success_email(
-        "gmv_max_live",
         run_key=run_key,
         log_path=f"logs/run_{run_key}/etl_full_{run_key}.log" if run_key else "",
         status=status,

@@ -48,7 +48,6 @@ if __name__ == "__main__":
         )
         ctx = pipeline_mod._failure_ctx or {}
         subject, body_html = build_pipeline_failure_email(
-            "gmv_max_live",
             e,
             run_key=run_key,
             log_path=log_path,

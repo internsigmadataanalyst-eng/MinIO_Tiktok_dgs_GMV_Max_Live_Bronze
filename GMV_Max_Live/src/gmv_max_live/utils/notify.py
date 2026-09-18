@@ -495,11 +495,17 @@ def build_recovery_email(
     recovered_rows: int = 0,
     absent: int = 0,
     count_mismatch_skipped: int = 0,
+    dataset_name: str = "",
     bq_updates: list[dict] | None = None,
+    pipeline_name: str = PIPELINE_NAME,
 ) -> tuple[str, str]:
     """Summary email when previously-broken rows are recovered and re-loaded."""
-    subject = f"[ETL ALERT] Error recovery — {recovered_rows} row(s) recovered"
-    parts = [
+    subject = f"[ETL RECOVERY - {PIPELINE_NAME}] {recovered_rows} row(s) recovered"
+    parts = []
+    if dataset_name:
+        parts.append(f"<p><b>Dataset:</b> {_html.escape(str(dataset_name))}</p>")
+    parts += [
+
         f"<p><b>Resolved error entries:</b> {resolved}</p>",
         f"<p><b>Rows re-loaded (path A):</b> {recovered_rows}</p>",
         f"<p><b>Absent (rows removed from sheet):</b> {absent}</p>",
