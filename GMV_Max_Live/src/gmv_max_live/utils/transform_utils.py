@@ -1,5 +1,7 @@
 # src/gmv_max_produk/utils/transform_utils.py
 import re
+import warnings
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Union
@@ -241,6 +243,14 @@ def validate_and_normalize_raw(
     df_clean[date_col] = parsed
     date_error = parsed.isna()
 
+    date_error = parsed.isna()
+
+    # Future-date gate (soft quarantine): a validly-parsed date strictly after
+    # today is a wrong input. It is routed to df_error so it never reaches the
+    # watermark filter (thus cannot advance the watermark / poison ingestion).
+    today_ts = pd.Timestamp(datetime.now().date())
+    date_future = parsed.notna() & (parsed > today_ts)
+
     # Blank toko detection — verbatim, no normalization; blank = "", "-", "nan", "none", "nat"
     toko_col = "Toko" if "Toko" in df.columns else ("toko" if "toko" in df.columns else None)
     if toko_col is not None:
@@ -250,7 +260,7 @@ def validate_and_normalize_raw(
     else:
         toko_blank = pd.Series(False, index=df.index)
 
-    error_mask = (corruption["affected_mask"] | date_error | toko_blank) & ~blank_mask
+    error_mask = (corruption["affected_mask"] | date_error | toko_blank | date_future) & ~blank_mask
 
     df_error = df[error_mask].copy()
     reasons = []
@@ -260,6 +270,8 @@ def validate_and_normalize_raw(
             reason_parts.append("numeric_mixed")
         if date_error.loc[idx]:
             reason_parts.append("date_unparsable")
+        if date_future.loc[idx]:
+            reason_parts.append("date_future")
         if toko_blank.loc[idx]:
             reason_parts.append("toko_blank")
         reasons.append("|".join(reason_parts))
@@ -275,6 +287,7 @@ def validate_and_normalize_raw(
         "affected_dates": corruption["affected_dates"],
         "n_bad_rows": int(error_mask.sum()),
         "n_date_errors": int(date_error.sum()),
+        "n_date_future": int(date_future.sum()),
         "n_blank_rows": int(blank_mask.sum()),
         "n_toko_blank": int(toko_blank.sum()),
     }
@@ -297,14 +310,23 @@ def parse_mixed_dates(series: pd.Series, return_date=True) -> pd.Series:
     mask_dmy2 = s_norm.str.match(r"^\s*\d{1,2}/\d{1,2}/\d{2}\s*$", na=False)
     dmy2 = pd.to_datetime(s_norm.where(mask_dmy2), format="%d/%m/%y", errors="coerce")
 
-    iso_generic = pd.to_datetime(s, errors="coerce", format=None)
-
     mask_serial = s.str.match(r"^\d{3,6}$", na=False)
     serial_vals = pd.to_numeric(s.where(mask_serial), errors="coerce")
     serial = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
     serial.loc[mask_serial] = EXCEL_EPOCH + pd.to_timedelta(
         serial_vals.loc[mask_serial], unit="D"
     )
+
+    remaining_mask = (
+        ymd.isna() & dmy4.isna() & dmy2.isna() & serial.isna() & ~s.isna()
+    )
+    iso_generic = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if remaining_mask.any():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            iso_generic.loc[remaining_mask] = pd.to_datetime(
+                s.loc[remaining_mask], errors="coerce", format="mixed"
+            )
 
     parsed = (
         ymd.combine_first(dmy4)

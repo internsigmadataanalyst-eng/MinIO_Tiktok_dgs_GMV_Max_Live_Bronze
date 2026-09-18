@@ -2,7 +2,7 @@
 import os
 import json
 import io
-from datetime import datetime
+from datetime import datetime, date
 from minio import Minio
 from minio.error import S3Error
 import pandas as pd
@@ -270,7 +270,40 @@ def _confirmed_recovered_keys(df_valid: pd.DataFrame, candidates: list) -> set:
     return confirmed
 
 
-def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH, df_valid: pd.DataFrame = None):
+def _is_date_future_entry(rec: dict) -> bool:
+    """True when a manifest entry carries the 'date_future' error reason.
+
+    A future-date wrong input, once corrected, ALWAYS changes its error_date key
+    (the row moves to the corrected date), so the strict count-match recovery can
+    never resolve it. For this specific error type, "no longer present in this
+    run's errors" is reliable proof of remediation (the date was corrected or the
+    row removed). Mixed-reason groups still resolve on 'date_future' being present
+    (per requirements), since the future-date defect was remediated regardless.
+    """
+    reasons = rec.get("error_reasons") or []
+    return "date_future" in reasons
+
+
+def _is_legacy_future_date(rec: dict) -> bool:
+    """True for a one-time legacy entry created BEFORE date_future tagging.
+
+    Such entries lack the 'error_reasons' field, so we fall back to a heuristic:
+    if the stored error_date parses to a date strictly after today, it is a stale
+    future-date artifact. Only applied when the field is absent (None), so already-
+    tagged entries are never double-classified. Once written, every entry carries
+    'error_reasons', making this effectively a one-time cleanup pass.
+    """
+    reasons = rec.get("error_reasons")
+    if reasons is not None:
+        return False
+    d = rec.get("error_date")
+    try:
+        return pd.to_datetime(d).date() > date.today()
+    except Exception:
+        return False
+
+
+def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH, df_valid: pd.DataFrame = None, dry_run: bool = False):
     """Syncs the error manifest at error_list_watermark/error_manifest.json.
 
     Grain is (sheet_name, creds, toko, error_date) — same as watermark (creds,sheet_name,toko) plus error_date.
@@ -279,9 +312,13 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
       2. Builds current-run entries from df_error grouped by
          (sheet_name, creds, toko, error_date) — the same grain as the watermark.
       3. Resolves only entries whose key is no longer detected this run AND is
-         PROVEN recovered (matching rows exist in df_valid with count == n_rows).
-         Confirmed entries are removed from the manifest and written as fix
-         records to fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
+         PROVEN recovered (matching rows exist in df_valid with count == n_rows),
+         OR carries a 'date_future' error reason (correcting a wrong date changes
+         its key, so count-match can never fire; absence this run is proof of
+         remediation), OR is a legacy pre-tagging entry whose stored error_date is
+         in the future (one-time cleanup). Resolved entries are removed from the
+         manifest and written as fix records to
+         fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
       4. Refreshes open entries still detected this run with the latest
          n_rows / affected_columns / path, and appends new open entries not
          already present.
@@ -337,6 +374,9 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
                 "toko": str(toko),
                 "error_date": str(error_date),
                 "affected_columns": list(report["affected_columns"]),
+                "error_reasons": sorted({
+                    str(r) for r in df_error.loc[idx, "error_reason"]
+                }) if "error_reason" in df_error.columns else [],
                 "n_rows": int(len(idx)),
                 "reported_at": now,
                 "path": quarantine_path,
@@ -378,12 +418,16 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
 
     resolved = []
     refreshed = {}
+    n_legacy_resolved = 0
     for rec in open_records:
         key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("toko") or ""), str(rec.get("error_date")))
         if key in current_keys:
             refreshed[key] = rec
-        elif key in confirmed:
+        elif key in confirmed or _is_date_future_entry(rec):
             resolved.append(rec)
+        elif _is_legacy_future_date(rec):
+            resolved.append(rec)
+            n_legacy_resolved += 1
         else:
             refreshed[key] = rec  # unconfirmed -> keep open
 
@@ -415,27 +459,37 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
             "path": r.get("path", ""),
             "status": "fixed",
         } for r in resolved]
-        minio_client.put_object(bucket, fix_folder, io.BytesIO(b""), length=0)
-        payload = json.dumps({"fixes": fixes}, ensure_ascii=False).encode("utf-8")
+        if dry_run:
+            print(f"[DRY-RUN] Akan tulis fix record {len(fixes)} error entr(y/ies) -> {fix_path}")
+        else:
+            minio_client.put_object(bucket, fix_folder, io.BytesIO(b""), length=0)
+            payload = json.dumps({"fixes": fixes}, ensure_ascii=False).encode("utf-8")
+            minio_client.put_object(
+                bucket,
+                fix_path,
+                io.BytesIO(payload),
+                length=len(payload),
+                content_type="application/json",
+            )
+            print(f"[MINIO] Resolved {len(fixes)} error entr(y/ies) -> fix record: {fix_path}")
+
+    if n_legacy_resolved:
+        print(f"[MINIO] Cleaned {n_legacy_resolved} legacy future-date error entr(y/ies)")
+
+    if dry_run:
+        if current_entries:
+            print(f"[DRY-RUN] Akan sync {len(current_entries)} open error entr(y/ies) ke {manifest_path}")
+    else:
+        payload = json.dumps({"errors": remaining}, ensure_ascii=False).encode("utf-8")
         minio_client.put_object(
             bucket,
-            fix_path,
+            manifest_path,
             io.BytesIO(payload),
             length=len(payload),
             content_type="application/json",
         )
-        print(f"[MINIO] Resolved {len(fixes)} error entr(y/ies) -> fix record: {fix_path}")
-
-    payload = json.dumps({"errors": remaining}, ensure_ascii=False).encode("utf-8")
-    minio_client.put_object(
-        bucket,
-        manifest_path,
-        io.BytesIO(payload),
-        length=len(payload),
-        content_type="application/json",
-    )
-    if current_entries:
-        print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
+        if current_entries:
+            print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
     return resolved
 
 

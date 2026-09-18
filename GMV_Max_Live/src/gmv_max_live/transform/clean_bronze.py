@@ -12,23 +12,6 @@ from src.gmv_max_live.utils.transform_utils import (
 )
 from src.gmv_max_live.utils.minio_client import filter_by_sheet_watermark
 
-# NUMERIC_COLS = [
-#     "Biaya",
-#     "Biaya Bersih",
-#     "Pesanan (SKU)",
-#     "Pesanan (Toko saat ini)",
-#     "Biaya per pesanan (Toko saat ini)",
-#     "Pendapatan kotor",
-#     "Penghasilan bruto (Toko saat ini)",
-#     "ROI (Toko saat ini)",
-#     "Tayangan LIVE",
-#     "Biaya per tayangan LIVE",
-#     "Tayangan LIVE 10 detik",
-#     "Biaya per tayangan LIVE 10 detik",
-#     "Pengikut saat LIVE",
-# ]
-
-
 def _canon(x):
     import pandas as pd
 
@@ -46,10 +29,6 @@ def build_bronze_maxl(
     Watermark grain is (creds, sheet_name, toko) — toko verbatim.
     Output: (df siap di-load ke BRONZE_DB.bronze_gmv_max_live, sheet_max_dates: {(creds,sheet_name,toko):iso})
     """
-    # # numeric cleaning
-    # tiktok_maxl_clean = clean_numeric_columns(
-    #     gmv_max_live_raw, NUMERIC_COLS, fillna_value=0
-    # )
 
     tiktok_maxl_clean = gmv_max_live_raw.copy()
 

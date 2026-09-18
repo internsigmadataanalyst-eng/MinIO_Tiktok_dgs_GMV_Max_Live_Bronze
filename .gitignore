@@ -1,2 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
 .env
+
+# Testing
 run_daily_etl_original.py
+DFD_GMV_Max_Produk.docx
+DFD_Document.md
+
+# ETL logs
+logs/

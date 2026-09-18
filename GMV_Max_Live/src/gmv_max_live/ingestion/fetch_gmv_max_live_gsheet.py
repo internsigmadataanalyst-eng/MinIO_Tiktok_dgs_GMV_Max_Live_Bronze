@@ -4,6 +4,8 @@ import os
 import gspread
 import pandas as pd
 
+from src.gmv_max_live.utils.gsheet_client import with_retry_on_429
+
 
 SHEET_REGISTRY = {
     "matz": "SH_KEY_MATZ",
@@ -22,9 +24,9 @@ def fetch_gmv_max_live(gc: gspread.Client) -> pd.DataFrame:
     """
     frames = []
     for sheet_name, env_key in SHEET_REGISTRY.items():
-        sh = gc.open_by_key(os.getenv(env_key))
-        ws = sh.worksheet("GMV MAX Live")
-        values = ws.get_all_values()
+        sh = with_retry_on_429(gc.open_by_key, os.getenv(env_key))
+        ws = with_retry_on_429(sh.worksheet, "GMV MAX Live")
+        values = with_retry_on_429(ws.get_all_values)
         df_sheet = pd.DataFrame(values[3:], columns=values[2])
         df_sheet = df_sheet.loc[:, ~df_sheet.columns.duplicated()]
         df_sheet["creds"] = os.getenv(env_key)
