@@ -4,17 +4,30 @@ import os
 import io
 import traceback
 from datetime import datetime
-from google.oauth2 import service_account
 
 import pandas as pd
 
 from dotenv import load_dotenv
 
-# Load variables from .env into environment
 load_dotenv()
 
+from src.gmv_max_live.pipelines.config import (
+    PROJECT_ID,
+    WATERMARK_PATH,
+    SRC_GSHEET,
+    SRC_MINIO,
+    TGT_MINIO,
+    TGT_MINIO_QUARANTINE,
+    TGT_BQ_BRONZE,
+    TGT_BQ_SILVER,
+    WHITELIST_SHEETS,
+    BQ_TARGETS,
+    _failure_ctx,
+    bq_full_load,
+    bq_noop,
+    get_credentials,
+)
 from src.gmv_max_live.utils.gsheet_client import get_gspread_client
-# from src.gmv_max_live.utils.bq_client import get_bq_client
 from src.gmv_max_live.utils.minio_client import (
     get_minio_client,
     get_sheet_watermarks,
@@ -39,6 +52,8 @@ from src.gmv_max_live.load.load_to_bigquery import load_df
 from src.gmv_max_live.utils.bronze_compare import (
     effective_watermark_changes,
     show_watermark,
+    build_drift_rows,
+    write_wm_log,
 )
 from src.gmv_max_live.utils.log import (
     get_log_folder,
@@ -54,206 +69,41 @@ from src.gmv_max_live.utils.notify import (
     build_pipeline_success_email,
     build_quarantine_email,
     build_recovery_email,
+    finish,
     QUARANTINE_SAMPLE_ROWS,
     QUARANTINE_SAMPLE_COLUMNS,
 )
-
-PROJECT_ID = "database-sigma"
-WATERMARK_PATH = "watermarks/gmv_max.json"
-
-SRC_GSHEET = {"system": "Google_Sheets", "entity": "GMV Max Live"}
-SRC_MINIO = {"system": "MinIO", "entity": WATERMARK_PATH}
-TGT_MINIO = {"system": "MinIO", "entity": "gmv/max"}
-TGT_MINIO_QUARANTINE = {"system": "MinIO", "entity": "quarantine/gmv_max_live/"}
-TGT_BQ_BRONZE = {"system": "BigQuery", "entity": f"{PROJECT_ID}.Testing.bronze_maxl"}
-TGT_BQ_SILVER = {"system": "BigQuery", "entity": f"{PROJECT_ID}.Testing.silver_tt_ads_gmvmax_live"}
-WHITELIST_SHEETS = {"deni_etawa", "riwa_ajwa", "ian"} 
-
-# BigQuery targets summarized in every alert email (reminder of what this
-# project updates). Full project.dataset.table paths.
-BQ_TARGETS = [
-    {"table": TGT_BQ_BRONZE["entity"], "action": "append"},
-    {"table": TGT_BQ_SILVER["entity"], "action": "MERGE (silver upsert)"},
-]
-
-# Populated as the run advances through its write stages; read by main.py's
-# exception handler so the failure email knows the stage + rollback story.
-_failure_ctx = {
-    "stage": "",
-    "minio_files": [],
-    "rollback_hint": "",
-    "rollback_command": "",
-    "auto_rollback_note": "",
-} 
-
-
-def _bq_full_load(rows: int) -> list[dict]:
-    """BQ-update summary for a run that appended rows to bronze + merged silver."""
-    return [
-        {"table": TGT_BQ_BRONZE["entity"], "action": "append", "rows": rows},
-        {"table": TGT_BQ_SILVER["entity"], "action": "MERGE (silver upsert)"},
-    ]
-
-
-def _bq_noop() -> list[dict]:
-    """BQ-update summary for a successful run with no new rows to load."""
-    return [
-        {"table": TGT_BQ_BRONZE["entity"], "action": "no change", "rows": 0},
-        {"table": TGT_BQ_SILVER["entity"], "action": "no change"},
-    ]
-
-
-def _finish(
-    watermark_records,
-    note: str,
-    status: str = "",
-    dry_run: bool = False,
-    run_key: str = "",
-    watermark_updates: dict | None = None,
-    bq_updates: list[dict] | None = None,
-):
-    """Final step on every exit path: show the current watermark, print the
-    ETL DONE line, then send the success alert (skipped in dry-run)."""
-    show_watermark(watermark_records)
-    print(note)
-    subject, body_html = build_pipeline_success_email(
-        run_key=run_key,
-        log_path=f"logs/run_{run_key}/etl_full_{run_key}.log" if run_key else "",
-        status=status,
-        watermark_updates=watermark_updates,
-        bq_updates=bq_updates,
-    )
-    send_alert_email(subject, body_html, dry_run=dry_run)
-
-
-def _get_credentials():
-    sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not sa_path:
-        raise RuntimeError("Env GOOGLE_APPLICATION_CREDENTIALS belum di-set")
-    return service_account.Credentials.from_service_account_file(sa_path)
+from src.gmv_max_live.utils.recovery import select_recovered
 
 
 def _fetch_existing_bronze_hashes(
-    creds, table_id="Testing.bronze_maxl", project_id=PROJECT_ID
+    creds, table_id="Testing.bronze_maxl", project_id=PROJECT_ID,
+    min_date: str | None = None,
 ) -> set:
-    """Returns the set of row_hash_raw already present in Bronze.
+    """Returns the set of row_hash_raw already present in Bronze,
+    scoped to rows at or after min_date (inclusive).
 
-    Used as an append-time idempotency gate: boundary-day rows (tanggal ==
-    watermark) and re-loaded recovery rows are legitimately re-selected by the
-    watermark filter every run; this drops the ones whose content is unchanged,
-    so Bronze stops accumulating duplicates while still accepting edits (a
-    changed row produces a NEW hash and flows through).
+    When min_date is provided, only rows with Tanggal >= min_date are
+    scanned — this catches the boundary-day re-emission row that the
+    watermark filter always re-selects, while keeping the query cheap.
     """
     from pandas_gbq import read_gbq
 
+    where = ""
+    if min_date:
+        where = f"WHERE Tanggal >= '{min_date}'"
+
     df_hashes = read_gbq(
-        f"SELECT DISTINCT row_hash_raw FROM `{project_id}.{table_id}`",
+        f"""
+        SELECT DISTINCT row_hash_raw
+        FROM `{project_id}.{table_id}`
+        {where}
+        """,
         project_id=project_id,
         credentials=creds,
         dialect="standard",
     )
     return set(df_hashes["row_hash_raw"].dropna().astype(str))
-
-
-def _select_recovered(
-    df_valid: pd.DataFrame, resolved: list, report: dict
-) -> pd.DataFrame:
-    """PATH A: select rows from df_valid that were recovered from a resolved error.
-
-    Grain is (sheet_name, creds, toko, error_date) — toko verbatim. A resolved
-    entry means the key was in the error manifest last run but is NO LONGER
-    in df_error this run (the data got fixed). Those rows bypass the watermark
-    filter downstream.
-
-    Full recovery only: we include the key's rows ONLY when the number of
-    valid rows now equals the manifest n_rows. Otherwise the group is either
-    only partially fixed (some rows still bad -> entry stays open) or extra
-    rows appeared on that historical date. Skipping avoids duplicates and
-    partial/incorrect recovery; the data is never silently lost because the
-    entry remains "open" and will be retried on a later run.
-
-    Counters are added to `report`:
-      recovery_resolved        : resolved keys considered
-      recovery_recovered_rows  : rows selected for Path A
-      recovery_count_mismatch  : keys fixed but row_count != n_rows (skipped)
-      recovery_absent          : resolved keys with no matching rows (deleted)
-    """
-    df = df_valid.copy()
-
-    if df.empty or not resolved:
-        report.setdefault("recovery_resolved", 0)
-        report.setdefault("recovery_recovered_rows", 0)
-        report.setdefault("recovery_count_mismatch", 0)
-        report.setdefault("recovery_absent", 0)
-        return df.iloc[0:0]
-
-    if "Toko" in df.columns:
-        toko_series = df["Toko"].astype(str)
-    elif "toko" in df.columns:
-        toko_series = df["toko"].astype(str)
-    else:
-        toko_series = pd.Series("", index=df.index, dtype=str)
-
-    try:
-        tanggal_str = df["Tanggal"].dt.date.astype(str)
-    except Exception:
-        tanggal_str = pd.to_datetime(df["Tanggal"]).dt.date.astype(str)
-
-    key_series = (
-        df["sheet_name"].astype(str)
-        + "|" + df["creds"].astype(str)
-        + "|" + toko_series
-        + "|" + tanggal_str
-    )
-
-    match = pd.Series(False, index=df.index)
-    count_mismatch = 0
-    absent = 0
-
-    for r in resolved:
-        key = f'{r["sheet_name"]}|{r["creds"]}|{r.get("toko") or ""}|{r["error_date"]}'
-        grp = df.index[key_series == key]
-        n_expected = int(r.get("n_rows") or 0)
-
-        if len(grp) == 0:
-            absent += 1                      # rows removed from sheet
-        elif len(grp) == n_expected:
-            match.loc[grp] = True            # fully recovered -> Path A
-        else:
-            count_mismatch += 1              # FIXED but count mismatch -> skip
-
-    report["recovery_resolved"] = len(resolved)
-    report["recovery_recovered_rows"] = int(match.sum())
-    report["recovery_count_mismatch"] = count_mismatch
-    report["recovery_absent"] = absent
-
-    return df[match]
-
-
-def _write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict_msg):
-    """Write the watermark drift check log file."""
-    wm_log_lines = []
-    wm_log_lines.append(
-        f"=== WATERMARK DRIFT CHECK - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
-    )
-
-    wm_log_lines.append("-" * 50)
-    wm_log_lines.append("DATASET: GMV MAX LIVE (toko grain)")
-    wm_log_lines.append("-" * 50)
-    wm_log_lines.append(f"  {'sheet':<10} {'grain':<12} {'gsheet':<12} {'wm':<12} {'status'}")
-    for _, row in status_df.iterrows():
-        wm_log_lines.append(
-            f"  {str(row['sheet_name']):<10} {str(row['grain']):<12} "
-            f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
-            f"{'BEHIND' if row['is_behind'] else 'ok'}"
-        )
-
-    wm_log_lines.append(f"\nGate verdict: {verdict_msg}")
-    pass_count = int(sheet_passes.sum()) if len(sheet_passes) else 0
-    total = len(sheet_passes)
-    wm_log_lines.append(f"  {pass_count}/{total} sheets have >=1 toko behind")
-
-    write_section_log(log_folder, f"wm_monitor_logs_{run_key}.log", "\n".join(wm_log_lines) + "\n")
 
 
 def _write_failure_log(log_folder, run_key, message: str):
@@ -267,37 +117,6 @@ def _write_failure_log(log_folder, run_key, message: str):
     print(f"[FATAL] Failure written to: {f_path}")
 
 
-def _fmt_drift_date(val) -> str:
-    """Format a drift-check date value for the gate-2 email table ('' for NaT)."""
-    try:
-        if val is None or pd.isna(val):
-            return ""
-        if hasattr(val, "strftime"):
-            return val.strftime("%Y-%m-%d")
-        return str(val)
-    except Exception:
-        return str(val or "")
-
-
-def _build_drift_rows(status_df: pd.DataFrame) -> list[dict]:
-    """Per-sheet watermark drift summary from the pre-flight check.
-
-    Column order matches the gate-2 email table: Sheet | Toko | Sheet max date |
-    Current watermark | Status (BEHIND/ok). Sorted by sheet_name then toko.
-    """
-    rows = []
-    for _, row in status_df.iterrows():
-        rows.append({
-            "sheet_name": str(row.get("sheet_name") or ""),
-            "toko": str(row.get("grain") or ""),
-            "gsheet_max": _fmt_drift_date(row.get("sheet_max_tanggal")),
-            "watermark": _fmt_drift_date(row.get("last_processed_date")),
-            "status": "BEHIND" if row.get("is_behind") else "ok",
-        })
-    rows.sort(key=lambda r: (r["sheet_name"], r["toko"]))
-    return rows
-
-
 def run_daily_etl(dry_run: bool | None = None):
     print("== Start ETL GMV Max Live ==")
 
@@ -307,29 +126,23 @@ def run_daily_etl(dry_run: bool | None = None):
     if dry_run:
         print("[DRY-RUN] Mode aktif: TIDAK ada data yang ditulis ke MinIO/BigQuery/Silver.")
 
-    # Failure context tracker for main.py's exception handler. Cleared on each
-    # run so a stale stage never leaks into a later run's failure email.
     _failure_ctx.clear()
     _failure_ctx.update({
         "stage": "", "minio_files": [], "rollback_hint": "",
-        "rollback_command": "", "auto_rollback_note": "",
     })
 
     # 1) Client
     gc = get_gspread_client()
-    # bq_client = get_bq_client()
-    creds = _get_credentials()
+    creds = get_credentials()
     minio_client, minio_bucket = get_minio_client()
 
-    # 2) Date key: partition pakai YYYYMMDD, nama file pakai YYYYMMDDHHMM
-    #    (jam+menit agar 2 run di hari yang sama menghasilkan file terpisah, tanpa overwrite).
+    # 2) Date key
     now_obj = datetime.now()
     today_key = now_obj.strftime("%Y%m%d")
     run_key = now_obj.strftime("%Y%m%d%H%M")
     log_folder = get_log_folder(run_key) if not dry_run else None
 
-    # Structured event logging (JSON-lines). In standalone runs, set up a fresh
-    # event log so the pipeline events are still emitted.
+    # Structured event logging (JSON-lines).
     if not is_event_logging_enabled():
         _, stop_event_logging = setup_event_logging(run_key, dry_run)
     else:
@@ -371,8 +184,7 @@ def run_daily_etl(dry_run: bool | None = None):
                   "n_sheets": total_sheets, "n_behind": n_behind},
          source=SRC_MINIO)
 
-    # Gate 1: abort on access errors (enforced in dry-run too).
-    # Empty status_df (no watermark yet / first run) -> no errors, let gate 2 pass.
+    # Gate 1: abort on access errors
     has_errors = bool(len(status_df)) and status_df["status"].str.startswith("error").any()
     if has_errors:
         error_sheets = status_df[status_df["status"].str.startswith("error")]["sheet_name"].unique().tolist()
@@ -391,18 +203,19 @@ def run_daily_etl(dry_run: bool | None = None):
             lists={"error_sheets": error_sheets},
             note="Fix the sheet access issue and re-run.",
             bq_updates=BQ_TARGETS,
+            enable_explanation=not dry_run,
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
         if log_folder:
-            _write_wm_log(log_folder, run_key, status_df, pd.Series(dtype=bool),
-                          f"ABORT - access errors on sheets: {error_sheets}")
+            write_wm_log(log_folder, run_key, status_df, pd.Series(dtype=bool),
+                         f"ABORT - access errors on sheets: {error_sheets}")
             _write_failure_log(
                 log_folder, run_key,
                 f"access errors on sheets: {error_sheets}",
             )
         return
 
-    # Gate 2: each sheet must have >=1 toko behind (enforced in dry-run too)
+    # Gate 2: each sheet must have >=1 toko behind
     sheet_passes = status_df.groupby("sheet_name")["is_behind"].any()
     caught_up = [s for s in sheet_passes[~sheet_passes].index.tolist() if s not in WHITELIST_SHEETS]
     behind_sheets = sheet_passes[sheet_passes].index.tolist()
@@ -490,12 +303,13 @@ def run_daily_etl(dry_run: bool | None = None):
                 else ""
             ),
             bq_updates=BQ_TARGETS,
-            drift_rows=_build_drift_rows(status_df),
+            drift_rows=build_drift_rows(status_df),
+            enable_explanation=not dry_run,
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
         if log_folder:
-            _write_wm_log(log_folder, run_key, status_df, sheet_passes,
-                          f"ABORT - sheets with no new data: {caught_up}")
+            write_wm_log(log_folder, run_key, status_df, sheet_passes,
+                         f"ABORT - sheets with no new data: {caught_up}")
             _write_failure_log(log_folder, run_key,
                                f"sheets with no new data (already up-to-date): {caught_up}")
         return
@@ -507,24 +321,21 @@ def run_daily_etl(dry_run: bool | None = None):
         pass_count = int(sheet_passes.sum())
         total = len(sheet_passes)
         verdict = f"PASS - {pass_count}/{total} sheets have >=1 toko behind"
-        _write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict)
+        write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict)
 
     # 3) Per-sheet watermark check
     watermark_map, watermark_records = get_sheet_watermarks(
         minio_client, minio_bucket, WATERMARK_PATH
     )
 
-    # 4) Ingest from GSheet (each sheet tagged with sheet_name)
+    # 4) Ingest from GSheet
     df_raw = fetch_gmv_max_live(gc)
     print(f"[INGEST] Rows raw from GSheet: {len(df_raw)}")
     emit("INGEST", "gsheet_ingester", f"Fetched {len(df_raw)} raw rows from GSheet",
          metrics={"rows_raw": int(len(df_raw))},
          source=SRC_GSHEET)
 
-    # 4b) STEP 2: validate & normalize as early as possible (mixed-column
-    #     detection + date-error capture). Runs exactly once, before anything else.
-    
-    # buang baris tanpa id_campaign
+    # 4b) validate & normalize
     df_raw = df_raw[df_raw["ID Campaign"].astype(str).str.strip() != ""]
     df_valid, df_error, v_report = validate_and_normalize_raw(
         df_raw, NUMERIC_COLS, percent_cols=PERCENT_COLS
@@ -556,35 +367,39 @@ def run_daily_etl(dry_run: bool | None = None):
             f"---> {v_report['last_affected_date']}"
         )
 
-    # STEP 3Q/6: sync error manifest EVERY run (append new open entries +
-    # resolve entries whose format has been fixed since the last run).
-    # Resolved entries feed PATH A (error recovery) below.
-    resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid, dry_run=dry_run)
-
+    # STEP 3Q/6: sync error manifest
     df_error_new = (
         filter_already_quarantined(minio_client, minio_bucket, df_error)
         if not df_error.empty
         else df_error
     )
-    if not df_error_new.empty:
-        if "error_reason" in df_error_new.columns:
-            all_reasons = df_error_new["error_reason"].str.split("|").explode()
-            reason_counts = all_reasons.value_counts()
-            col_pattern = df_error_new["error_reason"].str.findall(r"date_unparsable\((\w+)=")
-            affected_from_dates = set()
-            for cols in col_pattern:
-                affected_from_dates.update(cols)
-            affected_cols = sorted(affected_from_dates | set(v_report.get("affected_columns", [])))
-        else:
-            reason_counts = None
-            affected_cols = []
 
+    resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid, dry_run=dry_run)
+
+    n_dupes_skipped = max(0, len(df_error) - len(df_error_new))
+    src_rows = df_error_new if not df_error_new.empty else df_error
+    reason_counts = {}
+    affected_cols = []
+    if not src_rows.empty and "error_reason" in src_rows.columns:
+        reason_counts = (
+            src_rows["error_reason"].str.split("|")
+            .explode().value_counts().to_dict()
+        )
+        affected_from_dates = set()
+        for cols in src_rows["error_reason"].str.findall(r"date_unparsable\((\w+)="):
+            affected_from_dates.update(cols)
+        affected_cols = sorted(
+            affected_from_dates | set(v_report.get("affected_columns", []))
+        )
+    elif not src_rows.empty:
+        affected_cols = sorted(set(v_report.get("affected_columns", [])))
+
+    if not df_error_new.empty:
         if dry_run:
             print(f"[DRY-RUN] Akan quarantine {len(df_error_new)} bad row(s)")
         else:
             write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key)
 
-            # Write quarantine log with summary + sample bad rows
             if log_folder:
                 import re as _re
                 q_lines = []
@@ -592,19 +407,19 @@ def run_daily_etl(dry_run: bool | None = None):
                 q_lines.append("Dataset: gmv_max_live")
                 q_lines.append(f"  Total quarantined rows: {len(df_error_new)}\n")
 
-                if reason_counts is not None:
+                if reason_counts:
                     q_lines.append("  Error reasons breakdown:")
                     for reason, count in reason_counts.items():
                         q_lines.append(f"    {reason} : {count} rows")
                     q_lines.append("")
 
-                    if affected_cols:
-                        q_lines.append(f"  Affected columns: {affected_cols}\n")
+                if affected_cols:
+                    q_lines.append(f"  Affected columns: {affected_cols}\n")
 
                 sample = df_error_new.head(5)
                 q_lines.append(f"  Sample bad rows (first {len(sample)}):")
                 display_cols = [c for c in ["Tanggal", "tanggal", "Toko", "toko",
-                                             "ID Campaign", "id_campaign", "error_reason"] if c in sample.columns]
+                                             "ID Pesanan", "id_pesanan", "error_reason"] if c in sample.columns]
                 if display_cols:
                     header = " | ".join(f"{c:<15}" for c in display_cols)
                     q_lines.append(f"    | {header} |")
@@ -614,27 +429,34 @@ def run_daily_etl(dry_run: bool | None = None):
                         q_lines.append(f"    | {vals} |")
 
                 q_lines.append("")
-                write_section_log(log_folder, f"quarantine_errors_{run_key}.log", "\n".join(q_lines) + "\n")
+                # write_section_log(log_folder, f"quarantine_errors_{run_key}.log", "\n".join(q_lines) + "\n")
 
+    if not df_error.empty:
         emit(
             "QUARANTINE", "validator",
-            f"{len(df_error_new)} bad row(s) quarantined",
+            f"{len(df_error_new)} bad row(s) quarantined (new) | "
+            f"{n_dupes_skipped} already-known duplicate(s) skipped",
             level="WARN",
-            metrics={"n_quarantined": int(len(df_error_new))},
+            metrics={
+                "n_quarantined": int(len(df_error_new)),
+                "n_detected": int(len(df_error)),
+                "n_duplicates_skipped": int(n_dupes_skipped),
+            },
             source=SRC_GSHEET,
             target=TGT_MINIO_QUARANTINE,
         )
         subject, body_html = build_quarantine_email(
-            len(df_error_new),
+            len(df_error),
             reason_counts,
             affected_cols,
             sample_rows=[
-                {c: r[c] for c in QUARANTINE_SAMPLE_COLUMNS if c in df_error_new.columns}
-                for _, r in df_error_new.head(QUARANTINE_SAMPLE_ROWS).iterrows()
+                {c: r[c] for c in QUARANTINE_SAMPLE_COLUMNS if c in src_rows.columns}
+                for _, r in src_rows.head(QUARANTINE_SAMPLE_ROWS).iterrows()
             ],
+            n_duplicates_skipped=int(n_dupes_skipped),
             minio_path=(
                 f"{QUARANTINE_PREFIX}/date={today_key}/quarantine_{run_key}.parquet"
-                if not dry_run
+                if not dry_run and not df_error_new.empty
                 else ""
             ),
             log_path=(
@@ -643,11 +465,12 @@ def run_daily_etl(dry_run: bool | None = None):
                 else ""
             ),
             bq_updates=BQ_TARGETS,
+            enable_explanation=not dry_run,
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
 
-    # PATH A: recovered rows (fixed since last run) bypass the watermark.
-    df_recovered = _select_recovered(df_valid, resolved, v_report)
+    # PATH A: recovered rows
+    df_recovered = select_recovered(df_valid, resolved, v_report)
     print(
         f"[RECOVERY] resolved={v_report.get('recovery_resolved', 0)} "
         f"| recovered_rows={v_report.get('recovery_recovered_rows', 0)} "
@@ -677,6 +500,7 @@ def run_daily_etl(dry_run: bool | None = None):
             absent=v_report.get("recovery_absent", 0),
             count_mismatch_skipped=v_report.get("recovery_count_mismatch", 0),
             bq_updates=BQ_TARGETS,
+            enable_explanation=not dry_run,
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
 
@@ -686,8 +510,7 @@ def run_daily_etl(dry_run: bool | None = None):
         df_regular, sheet_watermarks=watermark_map
     )
 
-    # PATH A transform: empty watermarks = full load, max dates fed into the
-    # per-sheet watermark so recovered rows are not re-selected every run.
+    # PATH A transform
     if df_recovered.empty:
         df_bronze_recovered = df_bronze_regular.iloc[0:0]
     else:
@@ -702,11 +525,11 @@ def run_daily_etl(dry_run: bool | None = None):
         [df_bronze_regular, df_bronze_recovered], ignore_index=True
     ).drop_duplicates(subset=["row_hash_raw"])
 
-    # Idempotency gate: drop rows whose content hash already exists in Bronze.
-    # Boundary-day re-emissions and previously-recovered rows are re-selected by
-    # the watermark each run; only genuinely new/changed rows should be appended.
+    # Idempotency gate
     if not df_bronze.empty:
-        existing_hashes = _fetch_existing_bronze_hashes(creds)
+        batch_dates = df_bronze["tanggal"].dropna()
+        min_date = str(batch_dates.min().date()) if not batch_dates.empty else None
+        existing_hashes = _fetch_existing_bronze_hashes(creds, min_date=min_date)
         if existing_hashes:
             before = len(df_bronze)
             df_bronze = df_bronze[
@@ -732,9 +555,7 @@ def run_daily_etl(dry_run: bool | None = None):
          source=SRC_GSHEET,
          target=TGT_BQ_BRONZE)
 
-    # Nothing new to append: if rows were still selected (boundary-day /
-    # recovered re-emissions) but every one already exists in Bronze, advance
-    # the watermark anyway so they stop being re-selected every run.
+    # Nothing new to append: advance watermark anyway
     if df_bronze.empty and sheet_max_dates:
         if dry_run:
             changes = effective_watermark_changes(watermark_records, sheet_max_dates)
@@ -747,14 +568,14 @@ def run_daily_etl(dry_run: bool | None = None):
             emit("FINISH", "etl_pipeline", "ETL DONE (DRY-RUN) - watermark only",
                  metrics={"watermark_changes": len(changes)},
                  source=SRC_GSHEET, target=SRC_MINIO)
-            _finish(
+            finish(
                 watermark_records,
                 "== ETL GMV Max DONE (DRY-RUN) ==",
                 status="dry-run — watermark only",
                 dry_run=dry_run,
                 run_key=run_key,
                 watermark_updates=sheet_max_dates,
-                bq_updates=_bq_noop(),
+                bq_updates=bq_noop(),
             )
             return
         update_sheet_watermarks(
@@ -765,14 +586,14 @@ def run_daily_etl(dry_run: bool | None = None):
         emit("FINISH", "etl_pipeline", "ETL DONE - watermark advanced (no new rows)",
              metrics={"watermark_changes": len(sheet_max_dates)},
              source=SRC_GSHEET, target=SRC_MINIO)
-        _finish(
+        finish(
             watermark_records,
             "== ETL GMV Max DONE ==",
             status="no new rows — watermark advanced",
             dry_run=dry_run,
             run_key=run_key,
             watermark_updates=sheet_max_dates,
-            bq_updates=_bq_noop(),
+            bq_updates=bq_noop(),
         )
         return
 
@@ -781,13 +602,13 @@ def run_daily_etl(dry_run: bool | None = None):
         emit("FINISH", "etl_pipeline", "ETL DONE - no new data to process",
              metrics={"rows_loaded": 0},
              source=SRC_GSHEET, target=SRC_MINIO)
-        _finish(
+        finish(
             watermark_records,
             "== ETL GMV Max DONE ==",
             status="data is up to date — no new rows",
             dry_run=dry_run,
             run_key=run_key,
-            bq_updates=_bq_noop(),
+            bq_updates=bq_noop(),
         )
         return
 
@@ -809,14 +630,14 @@ def run_daily_etl(dry_run: bool | None = None):
              metrics={"rows_loaded": int(len(df_bronze)),
                       "watermark_changes": len(changes)},
              source=SRC_GSHEET, target=TGT_BQ_BRONZE)
-        _finish(
+        finish(
             watermark_records,
             "== ETL GMV Max Live DONE (DRY-RUN) ==",
             status="dry-run — full load (would run)",
             dry_run=dry_run,
             run_key=run_key,
             watermark_updates=changes,
-            bq_updates=_bq_full_load(len(df_bronze)),
+            bq_updates=bq_full_load(len(df_bronze)),
         )
         return
 
@@ -906,40 +727,13 @@ def run_daily_etl(dry_run: bool | None = None):
                 f"  Traceback:\n{traceback.format_exc()}",
             ]
             write_section_log(log_folder, f"bronze_parquet_errors_{run_key}.log", "\n".join(err_lines) + "\n")
-        # AUTO ROLLBACK: the watermark already advanced past rows that never hit
-        # bronze. Restore it (watermark scope only) so a re-run re-selects them.
-        rollback_note = ""
-        toggle = os.getenv("ETL_AUTO_ROLLBACK_WATERMARK", "true").strip().lower()
-        if toggle in {"1", "true", "yes", "y"}:
-            try:
-                from src.gmv_max_live.utils.minio_rollback import auto_restore_watermark
-
-                rollback_note = auto_restore_watermark(minio_client, minio_bucket, run_key)
-                print(f"[ROLLBACK] {rollback_note}")
-                emit("ROLLBACK", "minio_rollback", rollback_note,
-                     level="WARN" if "DONE" in rollback_note else "INFO",
-                     metrics={"run_key": run_key},
-                     source=SRC_MINIO, target=SRC_MINIO)
-            except Exception as rb_exc:
-                rollback_note = f"AUTO ROLLBACK ERROR: {type(rb_exc).__name__}: {rb_exc}"
-                print(f"[ROLLBACK] {rollback_note}")
-                emit("ROLLBACK", "minio_rollback", rollback_note,
-                     level="ERROR", metrics={"run_key": run_key},
-                     source=SRC_MINIO, target=SRC_MINIO)
         _failure_ctx.update({
             "stage": "BigQuery bronze load (append)",
             "minio_files": [file_path, WATERMARK_PATH],
             "rollback_hint": (
-                "MinIO parquet written AND the watermark already advanced, but the "
-                "bronze append FAILED. Rows past the watermark are not re-read by a "
-                "plain re-run - roll the MinIO watermark back before re-running, or "
-                "those rows will be skipped in BigQuery."
+                "Watermark NOT updated — a re-run will safely re-select "
+                "rows. No manual rollback needed."
             ),
-            "rollback_command": (
-                "python -m src.gmv_max_live.utils.minio_rollback "
-                f"--run-key {run_key} --scope full --dry-run"
-            ),
-            "auto_rollback_note": rollback_note,
         })
         raise
     print("[BRONZE] Load to Testing.bronze_maxl DONE")
@@ -988,17 +782,16 @@ def run_daily_etl(dry_run: bool | None = None):
     emit("FINISH", "etl_pipeline", "ETL GMV Max Live DONE",
          metrics={"rows_loaded": int(len(df_bronze))},
          source=SRC_GSHEET, target=TGT_BQ_SILVER)
-    _finish(
+    finish(
         watermark_records,
         "== ETL GMV Max Live DONE ==",
         status="full load finished — Silver MERGE done",
         dry_run=dry_run,
         run_key=run_key,
         watermark_updates=sheet_max_dates,
-        bq_updates=_bq_full_load(len(df_bronze)),
+        bq_updates=bq_full_load(len(df_bronze)),
     )
 
 
-# Kalau kamu mau bisa juga di-run langsung:
 if __name__ == "__main__":
     run_daily_etl()

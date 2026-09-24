@@ -11,6 +11,7 @@ run_daily_etl_original.py
 DFD_GMV_Max_Produk.docx
 DFD_Document.md
 GMV_Max_Live/src/gmv_max_live/pipelines/run_daily_etl_original.py
+tests/
 
 # ETL logs
 logs/

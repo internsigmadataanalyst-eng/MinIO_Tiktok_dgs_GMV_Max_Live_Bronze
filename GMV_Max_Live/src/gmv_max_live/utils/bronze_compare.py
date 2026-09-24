@@ -204,6 +204,66 @@ def show_watermark(watermark_records: list):
     _show_watermark(watermark_records)
 
 
+def fmt_drift_date(val) -> str:
+    """Format a drift-check date value for the gate-2 email table ('' for NaT)."""
+    try:
+        if val is None or pd.isna(val):
+            return ""
+        if hasattr(val, "strftime"):
+            return val.strftime("%Y-%m-%d")
+        return str(val)
+    except Exception:
+        return str(val or "")
+
+
+def build_drift_rows(status_df: pd.DataFrame) -> list[dict]:
+    """Per-sheet watermark drift summary from the pre-flight check.
+
+    Column order matches the gate-2 email table: Sheet | Toko | Sheet max date |
+    Current watermark | Status (BEHIND/ok). Sorted by sheet_name then toko.
+    """
+    rows = []
+    for _, row in status_df.iterrows():
+        rows.append({
+            "sheet_name": str(row.get("sheet_name") or ""),
+            "toko": str(row.get("grain") or ""),
+            "gsheet_max": fmt_drift_date(row.get("sheet_max_tanggal")),
+            "watermark": fmt_drift_date(row.get("last_processed_date")),
+            "status": "BEHIND" if row.get("is_behind") else "ok",
+        })
+    rows.sort(key=lambda r: (r["sheet_name"], r["toko"]))
+    return rows
+
+
+def write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict_msg):
+    """Write the watermark drift check log file."""
+    from datetime import datetime
+    from src.gmv_max_live.utils.log import write_section_log
+
+    wm_log_lines = []
+    wm_log_lines.append(
+        f"=== WATERMARK DRIFT CHECK - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+    )
+
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append("DATASET: GMV MAX LIVE (toko grain)")
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append(f"  {'sheet':<10} {'grain':<12} {'gsheet':<12} {'wm':<12} {'status'}")
+    for _, row in status_df.iterrows():
+        wm_log_lines.append(
+            f"  {str(row['sheet_name']):<10} {str(row['grain']):<12} "
+            f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
+            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+        )
+
+    wm_log_lines.append(f"\nGate verdict: {verdict_msg}")
+    pass_count = int(sheet_passes.sum()) if len(sheet_passes) else 0
+    total = len(sheet_passes)
+    wm_log_lines.append(f"  {pass_count}/{total} sheets have >=1 toko behind")
+
+    write_section_log(log_folder, f"wm_monitor_logs_{run_key}.log", "\n".join(wm_log_lines) + "\n")
+
+
 def finish(
     creds,
     watermark_records: list,
