@@ -6,12 +6,17 @@ __pycache__/
 # Secrets
 .env
 
+# Local docs / agent notes (not test artifacts)
+PLANNING_STAGE.md
+AGENTS.md
+
 # Testing
 run_daily_etl_original.py
 DFD_GMV_Max_Produk.docx
 DFD_Document.md
 GMV_Max_Live/src/gmv_max_live/pipelines/run_daily_etl_original.py
 tests/
+verify_quarantine_v2.py
 
 # ETL logs
 logs/

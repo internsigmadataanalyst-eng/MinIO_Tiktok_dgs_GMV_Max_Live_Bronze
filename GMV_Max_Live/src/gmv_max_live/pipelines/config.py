@@ -21,6 +21,13 @@ WHITELIST_SHEETS = set(
     s.strip() for s in os.getenv("WHITELIST_SHEETS", "deni_etawa,riwa_ajwa,ian").split(",") if s.strip()
 )
 
+# How long an open quarantine entry may keep the pre-flight gate open so PATH A
+# can re-admit recovered rows. After this, the entry stops satisfying the gate and
+# is reported in the gate-abort email instead (it is never silently forgotten).
+QUARANTINE_RECOVERY_MAX_AGE_DAYS = int(
+    os.getenv("QUARANTINE_RECOVERY_MAX_AGE_DAYS", "14")
+)
+
 BQ_TARGETS = [
     {"table": TGT_BQ_BRONZE["entity"], "action": "append"},
     {"table": TGT_BQ_SILVER["entity"], "action": "MERGE (silver upsert)"},

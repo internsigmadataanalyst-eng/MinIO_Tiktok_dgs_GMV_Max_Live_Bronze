@@ -220,7 +220,7 @@ def build_drift_rows(status_df: pd.DataFrame) -> list[dict]:
     """Per-sheet watermark drift summary from the pre-flight check.
 
     Column order matches the gate-2 email table: Sheet | Toko | Sheet max date |
-    Current watermark | Status (BEHIND/ok). Sorted by sheet_name then toko.
+    Current watermark | Status (UPDATE/ok). Sorted by sheet_name then toko.
     """
     rows = []
     for _, row in status_df.iterrows():
@@ -229,7 +229,7 @@ def build_drift_rows(status_df: pd.DataFrame) -> list[dict]:
             "toko": str(row.get("grain") or ""),
             "gsheet_max": fmt_drift_date(row.get("sheet_max_tanggal")),
             "watermark": fmt_drift_date(row.get("last_processed_date")),
-            "status": "BEHIND" if row.get("is_behind") else "ok",
+            "status": "UPDATE" if row.get("needs_update") else "ok",
         })
     rows.sort(key=lambda r: (r["sheet_name"], r["toko"]))
     return rows
@@ -253,13 +253,13 @@ def write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict_msg):
         wm_log_lines.append(
             f"  {str(row['sheet_name']):<10} {str(row['grain']):<12} "
             f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
-            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+            f"{'UPDATE' if row['needs_update'] else 'ok'}"
         )
 
     wm_log_lines.append(f"\nGate verdict: {verdict_msg}")
     pass_count = int(sheet_passes.sum()) if len(sheet_passes) else 0
     total = len(sheet_passes)
-    wm_log_lines.append(f"  {pass_count}/{total} sheets have >=1 toko behind")
+    wm_log_lines.append(f"  {pass_count}/{total} sheets have >=1 toko needing update")
 
     write_section_log(log_folder, f"wm_monitor_logs_{run_key}.log", "\n".join(wm_log_lines) + "\n")
 
