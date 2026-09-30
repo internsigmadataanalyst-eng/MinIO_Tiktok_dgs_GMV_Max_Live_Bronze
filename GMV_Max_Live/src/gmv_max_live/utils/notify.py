@@ -1,32 +1,19 @@
 # src/pesanan_affiliasi/utils/notify.py
-"""Email alerting for the ETL pipeline, with interchangeable backends selected
-via NOTIFY_BACKEND:
+"""Email alerting for the ETL pipeline, delivered over SMTP:
 
-  NOTIFY_BACKEND=smtp
     Plain smtplib + a Gmail App Password on a normal consumer Gmail account.
-    Use this when the domain is NOT on Google Workspace (no admin console,
-    only @gmail.com addresses). Setup:
+    No Google Workspace domain and no admin console needed — only a
+    @gmail.com address. Setup:
       1. Enable 2-Step Verification on the sending Gmail account.
       2. Create an App Password: myaccount.google.com/apppasswords
       3. Set NOTIFY_SENDER_EMAIL and NOTIFY_SENDER_APP_PASSWORD.
-    No domain, no admin access, no new external dependency required —
+    No domain, no admin access, no external dependency required —
     smtplib is in the Python standard library.
 
-  NOTIFY_BACKEND=gmail_api  (alternative)
-    Gmail API + domain-wide delegation on the existing service account
-    (the same key used by gsheet/bq clients). Requires a real Google
-    Workspace domain. Setup:
-      1. Enable the Gmail API on the GCP project (database-sigma).
-      2. Workspace Admin Console > Security > API Controls > Domain-wide
-         Delegation, add the service account's OAuth Client ID and scope:
-         https://www.googleapis.com/auth/gmail.send
-      3. Set NOTIFY_IMPERSONATE_EMAIL to a real Workspace mailbox.
-
-Whichever backend is active, send_alert_email() never raises: any setup gap
-or send failure is caught, logged via emit() (see utils/log.py) and returned
-as False, so a broken mail channel can never mask or interrupt the pipeline.
+send_alert_email() never raises: any setup gap or send failure is caught,
+logged via emit() (see utils/log.py) and returned as False, so a broken mail
+channel can never mask or interrupt the pipeline.
 """
-import base64
 import html as _html
 import os
 import smtplib
@@ -41,21 +28,10 @@ from src.gmv_max_live.utils.log import PIPELINE_NAME, emit
 # .env lives at the package root (GMV_Max_Live/.env), three levels up.
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-
-BACKEND = os.getenv("NOTIFY_BACKEND", "gmail_api")  # "smtp" | "gmail_api"
-
 # Master switch. When disabled, send_alert_email() is a silent no-op.
 ENABLED = os.getenv("NOTIFY_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "y",
 }
-
-# --- gmail_api backend config ---
-# Same service-account JSON already used by get_gsheet_client()/get_bq_client().
-SA_KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-# Mailbox the service account impersonates to send mail. Must be a real
-# Workspace user with a mailbox, delegated per the docstring above.
-IMPERSONATE_EMAIL = os.getenv("NOTIFY_IMPERSONATE_EMAIL", "")
 
 # --- smtp backend config ---
 SMTP_HOST = os.getenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
@@ -92,33 +68,6 @@ QUARANTINE_AI_TIMEOUT_S = int(os.getenv("QUARANTINE_AI_TIMEOUT_S", "15"))
 # gemini-3.x flash hides its reasoning inside the token budget, so a small
 # cap truncates the visible explanation — allow room for both.
 QUARANTINE_AI_MAX_TOKENS = int(os.getenv("QUARANTINE_AI_MAX_TOKENS", "1000"))
-
-
-def _send_via_gmail_api(subject: str, body_html: str, to_list: list[str]) -> None:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    if not IMPERSONATE_EMAIL:
-        raise RuntimeError(
-            "NOTIFY_IMPERSONATE_EMAIL is not set — domain-wide delegation "
-            "target mailbox is required before send_alert_email() can run."
-        )
-    if not SA_KEY_PATH or not Path(SA_KEY_PATH).exists():
-        raise RuntimeError(f"Service account key not found at {SA_KEY_PATH!r}")
-
-    creds = service_account.Credentials.from_service_account_file(
-        SA_KEY_PATH, scopes=SCOPES
-    ).with_subject(IMPERSONATE_EMAIL)
-
-    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-    msg = MIMEText(body_html, "html")
-    msg["to"] = ", ".join(to_list)
-    msg["from"] = IMPERSONATE_EMAIL
-    msg["subject"] = subject
-
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def _send_via_smtp(subject: str, body_html: str, to_list: list[str]) -> None:
@@ -171,7 +120,7 @@ def send_alert_email(
     recipients: Iterable[str] | None = None,
     dry_run: bool = False,
 ) -> bool:
-    """Send an HTML alert email via the configured backend (NOTIFY_BACKEND).
+    """Send an HTML alert email over SMTP.
 
     Returns True on success, False on any failure (never raises). No-op
     (True) when notifications are disabled; in dry-run mode the send is
@@ -183,9 +132,9 @@ def send_alert_email(
     to_list = list(recipients) if recipients else DEFAULT_RECIPIENTS
 
     if dry_run:
-        print(f"[notify] DRY RUN ({BACKEND}) — would send to {to_list}: {subject}")
+        print(f"[notify] DRY RUN (smtp) — would send to {to_list}: {subject}")
         emit("NOTIFY", "gmail_notifier",
-             f"DRY-RUN ({BACKEND}) would send alert to {to_list}: {subject}")
+             f"DRY-RUN (smtp) would send alert to {to_list}: {subject}")
         return True
 
     if not to_list:
@@ -195,15 +144,10 @@ def send_alert_email(
         return False
 
     try:
-        if BACKEND == "smtp":
-            _send_via_smtp(subject, body_html, to_list)
-        elif BACKEND == "gmail_api":
-            _send_via_gmail_api(subject, body_html, to_list)
-        else:
-            raise RuntimeError(f"Unknown NOTIFY_BACKEND: {BACKEND!r}")
+        _send_via_smtp(subject, body_html, to_list)
 
-        print(f"[notify] Alert email sent via {BACKEND}: {subject}")
-        emit("NOTIFY", "gmail_notifier", f"Alert email sent via {BACKEND}: {subject}",
+        print(f"[notify] Alert email sent via smtp: {subject}")
+        emit("NOTIFY", "gmail_notifier", f"Alert email sent via smtp: {subject}",
              metrics={"recipients": to_list})
         return True
 
@@ -213,9 +157,7 @@ def send_alert_email(
              f"SMTP error, alert NOT sent: {e}", level="ERROR")
         return False
     except Exception as e:
-        # Covers HttpError from googleapiclient (imported lazily above,
-        # so caught generically here rather than named at module level)
-        # plus any other setup/send failure.
+        # Any other setup/send failure (missing config, auth rejected, ...).
         print(f"[notify] {type(e).__name__}, alert NOT sent: {e}")
         emit("NOTIFY", "gmail_notifier",
              f"{type(e).__name__}, alert NOT sent: {e}", level="ERROR")
@@ -223,42 +165,22 @@ def send_alert_email(
 
 
 def notify_self_check() -> dict:
-    """Report what's configured vs. still missing for the active backend,
+    """Report what's configured vs. still missing for SMTP delivery,
     without sending anything or requiring network access."""
-    checks = {"backend": BACKEND}
+    checks = {
+        "sender email set": bool(SENDER_EMAIL),
+        "app password set": bool(SENDER_APP_PASSWORD),
+        "recipients set": bool(DEFAULT_RECIPIENTS),
+    }
 
-    if BACKEND == "gmail_api":
-        try:
-            import googleapiclient  # noqa: F401
-            checks["dependency installed"] = True
-        except ImportError:
-            checks["dependency installed"] = False
-        checks["key file found"] = bool(SA_KEY_PATH) and Path(SA_KEY_PATH).exists()
-        checks["impersonate email set"] = bool(IMPERSONATE_EMAIL)
-    elif BACKEND == "smtp":
-        checks["sender email set"] = bool(SENDER_EMAIL)
-        checks["app password set"] = bool(SENDER_APP_PASSWORD)
-    else:
-        checks["valid backend"] = False
-
-    checks["recipients set"] = bool(DEFAULT_RECIPIENTS)
-
-    print(f"[notify] Self-check (backend={BACKEND}):")
+    print("[notify] Self-check (backend=smtp):")
     for label, val in checks.items():
-        if label == "backend":
-            continue
         mark = "[OK]" if val else "[MISS]"
         print(f"  {mark} {label}")
 
-    expected_ok = all(v for k, v in checks.items() if k != "backend")
-    if expected_ok:
-        if BACKEND == "gmail_api":
-            print("  All config present. Note: this does NOT confirm domain-wide")
-            print("  delegation is actually granted — that only shows up as an")
-            print("  error on a real (non-dry-run) send attempt.")
-        else:
-            print("  All config present. A real (non-dry-run) send is still the")
-            print("  only way to confirm the App Password is valid.")
+    if all(checks.values()):
+        print("  All config present. A real (non-dry-run) send is still the")
+        print("  only way to confirm the App Password is valid.")
 
     if not ENABLED:
         print("  NOTE: NOTIFY_ENABLED=false — sending is currently a no-op.")

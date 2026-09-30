@@ -91,6 +91,15 @@ def build_bronze_maxl(
                 .astype(pd.Int64Dtype())
             )
 
+    # Jika Perubahan pada Gsheet permanen, sebaiknya schema bronze ditambahakan nama_produk
+    columns_to_drop = [
+        'id',
+        'durasi',
+        'roi'
+    ]
+
+    df = df.drop(columns=columns_to_drop)
+
     # Filter incremental per (creds,sheet_name,toko) — triple grain verbatim
     if "creds" in df.columns and "sheet_name" in df.columns and "toko" in df.columns:
         df, sheet_max_dates = filter_by_sheet_watermark(
